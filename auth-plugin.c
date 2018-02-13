@@ -1,258 +1,226 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include <mosquitto.h>
 #include <mosquitto_plugin.h>
 
-#include <krb5/krb5.h>
+#include <hiredis/hiredis.h>
+
+// -- function return code of MQTT
+// MOSQ_ERR_CONN_PENDING = -1,
+// MOSQ_ERR_SUCCESS = 0,
+// MOSQ_ERR_NOMEM = 1,
+// MOSQ_ERR_PROTOCOL = 2,
+// MOSQ_ERR_INVAL = 3,
+// MOSQ_ERR_NO_CONN = 4,
+// MOSQ_ERR_CONN_REFUSED = 5,
+// MOSQ_ERR_NOT_FOUND = 6,
+// MOSQ_ERR_CONN_LOST = 7,
+// MOSQ_ERR_TLS = 8,
+// MOSQ_ERR_PAYLOAD_SIZE = 9,
+// MOSQ_ERR_NOT_SUPPORTED = 10,
+// MOSQ_ERR_AUTH = 11,
+// MOSQ_ERR_ACL_DENIED = 12,
+// MOSQ_ERR_UNKNOWN = 13,
+// MOSQ_ERR_ERRNO = 14,
+// MOSQ_ERR_EAI = 15,
+// MOSQ_ERR_PROXY = 16
+
 
 typedef struct udata_t
 {
-	krb5_context context;
-	krb5_keytab keytab;
-	char *principal_format;
+    char host[128];
+    int port;
 } udata;
 
-static void report_error(udata *udata, const char *msg, krb5_error_code code)
-{
-	unsigned char readableCode = code;
-	const char *errmsg = krb5_get_error_message(udata->context, code);
-	mosquitto_log_printf(MOSQ_LOG_ERR, "%s: %s (%d)", msg, errmsg, readableCode);
-	krb5_free_error_message(udata->context, errmsg);
+void log_debug(char * format, ...) {
+    va_list aptr;
+    char buf[1024];
+    va_start(aptr, format);
+
+    vsprintf(buf, format, aptr);
+    mosquitto_log_printf(MOSQ_LOG_DEBUG, buf);
 }
+
+char buf[10240];
 
 int mosquitto_auth_plugin_version(void)
 {
-	return MOSQ_AUTH_PLUGIN_VERSION;
-}
-
-static int valid_format(const char *format)
-{
-	int inFormat = 0, seenSubst = 0;
-	for (const char *c = format; *c; ++c)
-		switch(*c)
-		{
-		case '%':
-			inFormat = !inFormat;
-			break;
-		case 's':
-			if (inFormat && seenSubst++ != 0)
-					return 0;
-			inFormat = 0;
-			break;
-		default:
-			if (inFormat)
-				return 0;
-			break;
-		}
-
-	if (!seenSubst)
-		mosquitto_log_printf(MOSQ_LOG_WARNING, "No substitutions in principal_format!");
-
-	return !inFormat;
+    log_debug("API call : mosquitto_auth_plugin_version(void)");
+    return MOSQ_AUTH_PLUGIN_VERSION;
 }
 
 int mosquitto_auth_plugin_init(void **user_data, struct mosquitto_auth_opt *auth_opts, int auth_opt_count)
 {
-	krb5_error_code ret;
-	udata *udata = *user_data = calloc(1, sizeof(struct udata_t));
+    log_debug("API call : mosquitto_auth_plugin_init");
 
-	if ((ret = krb5_init_context(&udata->context)))
-	{
-		report_error(udata, "Failed to create KRB5 context", ret);
-		free(udata);
-		return 1;
-	}
+    udata *udata = *user_data = calloc(1, sizeof(struct udata_t));
+    udata->port = 6379;
+    strcpy(udata->host, "localhost");
 
-	for (int i = 0; i < auth_opt_count; ++i)
-		if (!strcmp(auth_opts[i].key, "principal_format"))
-		{
-			udata->principal_format = strdup(auth_opts[i].value);
-			break;
-		}
+    for (int i = 0; i < auth_opt_count; ++i) {
+        log_debug("   plugin init, auth_opts[%d], %s : %s", i, auth_opts[i].key, auth_opts[i].value);
+        if (strcmp("auth_opt_redis_host", auth_opts[i].key) == 0) {
+            strncpy(udata->host, auth_opts[i].value, 127);
+            log_debug("udata->host : %s", udata->host);
+        }
+        if (strcmp("auth_opt_redis_port", auth_opts[i].key) == 0) {
+            udata->port = atoi(auth_opts[i].value);
+            log_debug("udata->host : %d", udata->port);
+        }
+    }
 
-	if (!udata->principal_format)
-		udata->principal_format = strdup("%s");
+    log_debug("Loaded mosquitto redis plugin");
+    return MOSQ_ERR_SUCCESS;
 
-	if (!valid_format(udata->principal_format))
-	{
-		mosquitto_log_printf(MOSQ_LOG_ERR, "Invalid principal_format");
-		free(udata->principal_format);
-		free(udata);
-		return 1;
-	}
-
-	mosquitto_log_printf(MOSQ_LOG_DEBUG, "Loaded mosquitto krb5 plugin");
-	return 0;
+    (void)udata;
 }
 
 int mosquitto_auth_plugin_cleanup(void *user_data, struct mosquitto_auth_opt *auth_opts, int auth_opt_count)
 {
-	udata *udata = user_data;
-	krb5_free_context(udata->context);
-	if (udata->principal_format)
-		free(udata->principal_format);
 
-	free(udata);
-	return 0;
+    log_debug("API call : mosquitto_auth_plugin_cleanup");
 
-	(void) auth_opts;
-	(void) auth_opt_count;
+    udata *udata = user_data;
+    free(udata);
+    return MOSQ_ERR_SUCCESS;
+
+    (void) auth_opts;
+    (void) auth_opt_count;
 }
 
 int mosquitto_auth_security_init(void *user_data, struct mosquitto_auth_opt *auth_opts, int auth_opt_count, bool reload)
 {
-	krb5_error_code ret;
-	udata *udata = user_data;
+    udata *udata = user_data;
 
-	const char *keytab = 0;
-	for (int i = 0; i < auth_opt_count; ++i)
-		if (!strcmp(auth_opts[i].key, "keytab"))
-			keytab = auth_opts[i].value;
+    log_debug("API call : mosquitto_auth_security_init");
 
-	if (keytab)
-		ret = krb5_kt_resolve(udata->context, keytab, &udata->keytab);
-	else
-		ret = krb5_kt_default(udata->context, &udata->keytab);
+    for (int i = 0; i < auth_opt_count; ++i) {
+        log_debug("API security init, auth_opts[%d], %s : %s", i, auth_opts[i].key, auth_opts[i].value);
+    }
 
-	if (ret)
-	{
-		report_error(udata, "Failed to create krb5 keytab", ret);
-		return MOSQ_ERR_UNKNOWN;
-	}
+    // return MOSQ_ERR_UNKNOWN;
+    return MOSQ_ERR_SUCCESS;
 
-	return 0;
-
-	(void) reload;
+    (void) udata;
+    (void) reload;
 }
 
 int mosquitto_auth_security_cleanup(void *user_data, struct mosquitto_auth_opt *auth_opts, int auth_opt_count, bool reload)
 {
-	udata *udata = user_data;
-	krb5_kt_close(udata->context, udata->keytab);
-	return 0;
+    udata *udata = user_data;
+    log_debug("API call : mosquitto_auth_security_cleanup");
+    return MOSQ_ERR_SUCCESS;
 
-	(void) auth_opts;
-	(void) auth_opt_count;
-	(void) reload;
+    (void) udata;
+    (void) auth_opts;
+    (void) auth_opt_count;
+    (void) reload;
 }
 
 int mosquitto_auth_acl_check(void *user_data, const char *clientid, const char *username, const char *topic, int access)
 {
-	return MOSQ_ERR_SUCCESS; // No ACL
+    log_debug("API call : mosquitto_auth_acl_check");
+    log_debug("API clientid %s, username %s, topic %s, access %d", clientid, username, topic, access);
 
-	(void) user_data;
-	(void) clientid;
-	(void) username;
-	(void) topic;
-	(void) access;
-}
+    udata *udata = user_data;
 
-static int decode_request(krb5_data *req, const char *encoded)
-{
-	if (!encoded || strlen(encoded) < 16)
-		return 0;
+    char * session_id = NULL;
+    {
+        char * buf = strdup(topic);
+        char * s = buf;
+        char * token = NULL;
+        int i = 0;
+        while ((token = strsep(&s, "/"))) {
+            log_debug("i %d, token %s", i, token);
+            if (i==0 && strcmp(token, "chat") != 0) {
+                log_debug("not a valid chat topic");
+                break;
+            }
+            if (i==2) {
+                session_id = strdup(token);
+                log_debug("store session id for future check : %s", session_id);
+            }
+            ++i;
+        }
+        free(buf);
+    }
 
-	if (sscanf(encoded, "%08x%08x", &req->magic, &req->length) != 2)
-		return 0;
+    int verified = 0;
+    if (session_id != NULL) {
+        log_debug("check redis %s:%d, for session id : %s", udata->host, udata->port, session_id);
 
-	if (strlen(encoded+16) < req->length)
-		return 0;
+        // redisContext *c = redisConnect("localhost", port);
+        redisContext *c = redisConnect(udata->host, udata->port);
 
-	char *o = req->data = calloc(1, req->length);
-	const char *c = encoded+16;
-	for (unsigned int i = 0, wasEscaped = 0; i < strlen(encoded+16); ++i, ++c, ++o)
-		switch(*o = *c)
-		{
-		case 1:
-			if ((wasEscaped = !wasEscaped))
-				--o;
-			break;
-		case 2:
-			if (wasEscaped)
-				*o = wasEscaped = 0;
-			break;
-		default:
-			wasEscaped = 0;
-			break;
-		}
+        if (c != NULL && c->err) {
+            log_debug("Error: %s", c->errstr);
+            // handle error
+        } else {
+            log_debug("Connected to Redis");
 
-	return 1;
-}
+            // cmd example :
+            //"AUTH password"
 
-static int check_principal(udata *udata, const char *username, krb5_principal client)
-{
-	krb5_error_code ret;
-	krb5_principal target_principal;
-	static char principalbuffer[1000];
+            char cmd[128];
+            sprintf(cmd, "GET %s", "3e42721d-9525-4ddf-bd3c-cb5e6caefdda");
+            // sprintf(cmd, "GET %s", session_id);
+            redisReply * r = redisCommand(c, cmd);
+            log_debug("redis reply type : %d", r->type);
+            if (r->type == REDIS_REPLY_STRING) {
+                // pwhash = strdup(r->str);
+                verified = 1;
+                log_debug("verified, redis reply string : %s", r->str);
+            }
+            freeReplyObject(r);
+        }
 
-	snprintf(principalbuffer, sizeof(principalbuffer), udata->principal_format, username);
+        redisFree(c);
 
-	if ((ret = krb5_parse_name(udata->context, principalbuffer, &target_principal)))
-	{
-		report_error(udata, "Failed to create target principal", ret);
-		return 0;
-	}
+        free(session_id);
+    }
+    else {
+        log_debug("other than chat, pass them through");
+        verified = 1;
+    }
 
-	krb5_boolean success = krb5_principal_compare(udata->context, client, target_principal);
-	krb5_free_principal(udata->context, target_principal);
+    if (verified == 1)
+        return MOSQ_ERR_SUCCESS;
+    else
+        return MOSQ_ERR_AUTH;
 
-	return success ? 1 : 0;
+    (void) user_data;
+    (void) clientid;
+    (void) username;
+    (void) topic;
+    (void) access;
 }
 
 int mosquitto_auth_unpwd_check(void *user_data, const char *username, const char *password)
 {
-	udata *udata = user_data;
+    udata *udata = user_data;
 
-	krb5_data req;
-	char *principal;
-	krb5_error_code ret;
-	krb5_ticket *ticket;
-	krb5_auth_context authcon;
+    log_debug("API call : mosquitto_auth_unpwd_check");
+    log_debug("API username %s, topic %s", username, password);
 
-	if ((ret = krb5_auth_con_init(udata->context, &authcon)))
-	{
-		report_error(udata, "Failed to create auth context", ret);
-		return MOSQ_ERR_UNKNOWN;
-	}
-
-	if (!decode_request(&req, password))
-	{
-		mosquitto_log_printf(MOSQ_LOG_ERR, "Failed to decode password as serialized krb5 REQ");
-		return MOSQ_ERR_UNKNOWN;
-	}
-
-	ret = krb5_rd_req(udata->context, &authcon, &req, NULL, udata->keytab, NULL, &ticket);
-	free(req.data);
-	krb5_auth_con_free(udata->context, authcon);
-
-	if (ret)
-	{
-		report_error(udata, "Failed to decode krb5 REQ", ret);
-		return MOSQ_ERR_UNKNOWN;
-	}
-
-	if ((ret = krb5_unparse_name(udata->context, ticket->enc_part2->client, &principal)))
-	{
-		report_error(udata, "Failed to decode principal in request", ret);
-		return MOSQ_ERR_UNKNOWN;
-	}
-
-	mosquitto_log_printf(MOSQ_LOG_INFO, "krb5 login attempt for principal: %s", principal);
-	krb5_free_string(udata->context, principal);
-
-	return check_principal(udata, username, ticket->enc_part2->client) ?
-		MOSQ_ERR_SUCCESS : MOSQ_ERR_AUTH;
+    return MOSQ_ERR_SUCCESS;
+    (void) udata;
 }
 
 int mosquitto_auth_psk_key_get(void *user_data, const char *hint, const char *identity, char *key, int max_key_len)
 {
-	return 1; // No PSK
+    log_debug("API call : mosquitto_auth_psk_key_get");
+    log_debug("API hint %s, indentity %s, key %s, max_key_len %d", hint, identity, key, max_key_len);
 
-	(void) user_data;
-	(void) hint;
-	(void) identity;
-	(void) key;
-	(void) max_key_len;
+    return 1;
+
+    (void) user_data;
+    (void) hint;
+    (void) identity;
+    (void) key;
+    (void) max_key_len;
 }
+
